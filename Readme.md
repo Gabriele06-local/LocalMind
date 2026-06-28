@@ -133,54 +133,83 @@ The all-MiniLM-L6-v2 model produces 384-dimensional embeddings, compared to 768 
 - **Search speed**: the SIMD dot product processes 48 iterations (384/8) per vector; smaller dimensions mean fewer iterations.
 - **Quality retention**: MiniLM retains ~95% of BERT-base's semantic quality on STS benchmarks, despite being 50% smaller and 2× faster at inference.
 
-## How it works
+## Technical Deep-Dive
 
-### 1. `extract.rs` — text extraction from multiple formats
+### Reciprocal Rank Fusion — why ranks, not scores
 
-Every file in the watch directory goes through `extract_text()`:
-- **TXT**: `std::fs::read_to_string`, plain UTF-8.
-- **PDF**: `pdf-extract` crate (uses `lopdf` backend), extracts all text from every page.
-- **DOCX**: the file is a ZIP archive; we extract `word/document.xml` and strip XML tags with a simple scanner. No XML parser dependency — tables, headers, and footers are discarded. Good enough for full-text search; if you need perfect document fidelity, that's what Word is for.
+Fusing a vector similarity score (bounded [0, 1]) with a BM25 score (unbounded, corpus-dependent) using a weighted sum would require normalizing both to the same range — and re-normalizing every time the document collection changes. LocalMind avoids this entirely by using **Reciprocal Rank Fusion (RRF)**:
 
-The hash for change detection is computed on **raw file bytes**, not on the extracted text. This ensures that a binary change (e.g., a PDF re-exported with different formatting) is correctly detected even if the extracted text happens to be identical.
+```
+RRF(doc) = 1 / (60 + rank_vec(doc))  +  1 / (60 + rank_bm25(doc))
+```
 
-### 2. `embed.rs` — BERT inference in Rust
+The insight is simple: both subsystems, no matter how different their scoring functions, produce a **ranked list** of documents. A rank is always an integer from 1 to N — it doesn't drift when you add files. The RRF formula transforms these ordinal positions into a fused score where:
 
-The model (`all-MiniLM-L6-v2` in safetensors format) is loaded with HuggingFace's [`candle`](https://github.com/huggingface/candle) framework, which runs pure Rust inference on CPU with no Python dependency. The pipeline:
+- A document ranked #1 by both systems gets `1/(60+1) + 1/(60+1) ≈ 0.033` — the highest possible.
+- A document ranked #1 by one system and #100 by the other gets `1/61 + 1/160 ≈ 0.023` — still competitive.
+- A document that BM25 doesn't match at all gets `0 + 1/(60+rank_vec)` — BM25 simply contributes nothing.
 
-1. **Tokenization**: `tokenizers` crate splits the text into WordPiece tokens. The model's max length is 256 tokens — longer texts are chunked with 50-token overlap, embedded separately, then averaged and re-normalized.
-2. **Forward pass**: candle runs the transformer layers. The matrix multiplications are handled by the [`gemm`](https://crates.io/crates/gemm) crate, which detects AVX-512/AVX2/SSE at runtime — this is where the ~55–65ms embedding time comes from, not from any code we wrote.
-3. **Mean pooling**: we take the last hidden state, mask out padding tokens using the attention mask, and compute the mean per dimension. This gives a single 384-dimensional vector.
-4. **L2 normalization**: each component is divided by the vector's Euclidean norm, producing a unit vector. This allows search to use a simple dot product (which equals cosine similarity for unit vectors).
+The constant `k = 60` controls how much weight a high rank has. With k=60, the difference between rank 1 and rank 10 is `(1/61 - 1/70) ≈ 0.002` — small enough that a document ranked #10 by both systems still beats one ranked #1 by one system and missing entirely from the other.
 
-### 3. `index.rs` — the binary format
+This stability is RRF's killer feature. You never touch k. You never re-normalize. You just run two independent searches and fuse the ranks.
 
-Described in detail above. The key design point is **all reads are O(1)**: vector at index `i` lives at byte offset `header_size + i * dim * 4`, path at index `i` has its offset and length in the entry table at `entry_offset + i * 12`. No variable-length encoding, no B-tree, no deserialization — just pointer arithmetic over a memory map.
+### The binary index format — O(1) access without deserialization
 
-### 4. `search.rs` — parallel cosine similarity
+Every "embedding file" in LocalMind is a single file with four contiguous regions:
 
-The query vector is broadcast to all threads via `rayon`. Each thread processes a chunk of the index, computing the dot product between the query and every stored vector using the SIMD-accelerated `cosine_similarity` function. The result is a `Vec<(f32, usize)>` of `(score, index)` pairs.
+```
+ Offset  │ Content
+─────────┼──────────────────────────────────────────────
+       0  │ Magic "LMND" (4 bytes) + version (u32)
+          │ + num_records (u32) + dimension (u32)      = 16 bytes
+─────────┼──────────────────────────────────────────────
+      16  │ Vectors: [f32; dim] × num_records
+          │ 8-byte aligned, packed contiguously
+          │ dim = 384, so each vector = 1536 bytes
+─────────┼──────────────────────────────────────────────
+ 16 + V  │ Entry table: {offset: u64, len: u32} × n
+          │ 12 bytes per entry, fixed stride
+─────────┼──────────────────────────────────────────────
+ 16+ V+E │ String block: concatenated path bytes
+          │ No separator — each entry's (offset, len)
+          │ tells you exactly where its path lives
+```
 
-To find the top-k results without sorting the entire list, we use `select_nth_unstable_by` (a partial O(n) selection) followed by `sort_unstable_by` on just the top-k candidates. For k=10 and n=10,000, this is ~100× faster than a full sort.
+The file is opened with `memmap2`, so the OS pages it in on demand:
 
-A guard clause (`if norm == 0.0 { return 0.0 }`) prevents NaN scores from empty or zeroed vectors — a defense-in-depth measure since the embedder should never produce zero vectors, but files can be empty.
+```rust
+// Reading vector i — one pointer dereference
+let vec_offset = 16 + i * dim * 4;
+let vector: &[f32] = bytemuck::cast_slice(
+    &mmap[vec_offset..vec_offset + dim * 4]
+);
 
-### 5. `monitor.rs` — live re-indexing
+// Reading path i — through the entry table
+let entry_offset = 16 + vec_block_size + i * 12;
+let path_offset = u64::from_ne_bytes(...);
+let path_len = u32::from_ne_bytes(...);
+let path = &mmap[path_offset..path_offset + path_len];
+```
 
-The polling loop:
-1. Recursively scans the watch directory, collecting paths with extensions `.txt`, `.pdf`, `.docx`, `.doc`.
-2. Computes `blake3` hash of each file's raw bytes.
-3. Compares with the previous scan's hashes. Files whose hash changed are re-embedded.
-4. Deleted files are removed from the index. New files are added.
-5. The new index is written to a temporary file, atomically renamed over the old one, and the `Arc<RwLock<Index>>` is swapped.
+No deserialization, no heap allocation, no `serde`. Every access is a pointer into the memory map. A search reads every vector (sequential scan, prefetcher-friendly) but only resolves paths for the top-k results.
 
-The `blake3` hasher is fast enough that hashing a 1 MB file takes ~50μs — negligible compared to BERT inference.
+The `Index` struct held by `Arc<RwLock<Index>>` is just `(memmap, len, dim)` — three fields, trivially cloneable via `Arc`. Swapping the entire index (during live re-indexing) means building a new file, memory-mapping it, and swapping one `Arc` pointer under a write lock. The old index continues serving queries from its memory map until the last `Arc` reference drops, at which point the OS unmaps it.
 
-### 6. `tui.rs` — terminal interface
+### Candle and CPU embedding — no GPU, no Python
 
-Built with [`ratatui`](https://crates.io/crates/ratatui) and [`crossterm`](https://crates.io/crates/crossterm). The event loop polls for input every 30ms. When the user types, a 200ms debounce timer starts — if no new key arrives within that window, the query is submitted. This prevents re-embedding on every keystroke.
+LocalMind runs BERT inference on CPU using [`candle`](https://github.com/huggingface/candle), HuggingFace's Rust framework. The decision to avoid Python (and GPU) is deliberate:
 
-Embedding and search run in a `tokio::spawn_blocking` task, keeping the UI responsive during inference. Results are sent back via a `tokio::sync::mpsc` channel and rendered in the next frame.
+- **Zero runtime dependencies**: no CUDA toolkit, no Python interpreter, no `libomp`. The binary is self-contained.
+- **Deterministic performance**: GPU inference has variable latency due to driver scheduling and VRAM contention. CPU inference at ~55ms is predictable and good enough for interactive search.
+- **Small model, big effect**: all-MiniLM-L6-v2 is 6 transformer layers × 384 hidden dims — ~22M parameters, ~90MB in safetensors format. Candle loads the weights directly with no conversion step.
+
+The actual matrix multiplication is handled by the [`gemm`](https://crates.io/crates/gemm) crate, which candle delegates to at build time. `gemm` detects the CPU's SIMD capabilities (AVX-512, AVX2, SSE) and selects the optimal kernel at compile time. On an Intel i7-12700H, the attention layers run at AVX2+FMA, producing an embedding in ~55–65ms.
+
+The tokenizer runs separately via the `tokenizers` crate (Rust bindings over the HuggingFace tokenizer Rust implementation in `tokenizers` 0.23). WordPiece encoding adds ~2-5ms per query for short text, dominated by the transformer forward pass.
+
+### Syntax-highlighted preview — instant file exploration
+
+When the user navigates results with arrow keys, the selected file is loaded, run through [`syntect`](https://crates.io/crates/syntect) with language detection by extension, and rendered in a right-side panel with syntax coloring. Query terms are highlighted in bold/yellow. The highlighted lines are cached in a `PreviewCache` struct — re-highlighting only happens when the selection changes, not on every frame.
 
 ## Benchmarks (CPU, no hardware acceleration)
 
