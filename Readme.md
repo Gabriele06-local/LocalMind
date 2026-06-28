@@ -1,6 +1,6 @@
 # LocalMind
 
-A **local semantic search engine** written in Rust. Indexes `.txt` files, embeds them into vectors via a BERT model (all-MiniLM-L6-v2), and provides real-time semantic search through a terminal UI.
+A **local semantic search engine** written in Rust. Indexes `.txt`, `.pdf`, and `.docx` files, embeds them into vectors via a BERT model (all-MiniLM-L6-v2), and provides real-time semantic search through a terminal UI.
 
 No external database, no cloud service, no API key. Everything runs locally on CPU.
 
@@ -23,7 +23,7 @@ No external database, no cloud service, no API key. Everything runs locally on C
 *Empty TUI — write a query and press Enter (or wait for automatic search)*
 
 ![Searching in progress](img/tui_searching.png)
-*Query submitted, embedding in progress (~1.5s on CPU)*
+*Query submitted, embedding in progress (~55–65ms on CPU, SIMD)*
 
 ![Results](img/tui_results.png)
 *Results with similarity score, keyboard navigation via arrows*
@@ -73,6 +73,8 @@ Embedding is accelerated by `candle`'s matrix multiplication backend ([`gemm` cr
 - **Brute-force search**: O(n) in the number of documents — parallelized but not approximated. Fine for tens of thousands of local files; for millions you'd want an approximate index (e.g., HNSW).
 - **English-centric tokenizer**: MiniLM handles Italian correctly via subword tokenization (e.g., "migliore" → `mig + ##lio + ##re`). Tests with mixed Italian/emoji/Japanese text produced valid embeddings (score 0.44 for "pizza"). The only `[UNK]` tokens were the emoji themselves. Semantic quality is still best for English.
 - **Polling monitor**: a pragmatic choice on Windows (`notify` produces unreliable `is_file` events). On Linux/macOS, `inotify`/`FSEvents` would be more responsive and consume zero CPU when nothing changes.
+- **No INT8 quantization**: candle 0.11.0 does not support quantized BERT forward passes (only quantized LLaMA/Mistral/Qwen2). The model runs at full FP32 precision (~55–65ms per embed).
+- **DOCX extraction is minimal**: the inline parser strips XML tags from `word/document.xml`. Tables, headers, footers, and embedded images are ignored.
 
 ## Installation
 
@@ -94,7 +96,7 @@ cargo run --release
 cargo run --release -- --demo
 ```
 
-The default watch directory is `%TEMP%\localmind_watch\` (Windows) or `/tmp/localmind_watch/`. Place `.txt` files there, then search.
+The default watch directory is `%TEMP%\localmind_watch\` (Windows) or `/tmp/localmind_watch/`. Place `.txt`, `.pdf`, or `.docx` files there, then search.
 
 In the TUI:
 
