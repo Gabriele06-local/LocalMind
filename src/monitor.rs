@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
@@ -35,8 +36,13 @@ pub struct LiveIndex {
 }
 
 impl LiveIndex {
-    pub fn new(data_dir: PathBuf, index_path: PathBuf, embedder: Arc<Embedder>) -> Result<Self> {
-        let records = scan_dir(&data_dir, &embedder)?;
+    pub fn new(
+        data_dir: PathBuf,
+        index_path: PathBuf,
+        embedder: Arc<Embedder>,
+        progress: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Result<Self> {
+        let records = scan_dir(&data_dir, &embedder, &progress)?;
 
         let mut paths: Vec<String> = Vec::new();
         let mut vectors: Vec<Vec<f32>> = Vec::new();
@@ -56,7 +62,7 @@ impl LiveIndex {
         let thr_emb = embedder.clone();
         let thr_recs = records.clone();
         std::thread::spawn(move || {
-            poll_loop(thr_dir, thr_index, thr_emb, thr_inner, thr_recs);
+            poll_loop(thr_dir, thr_index, thr_emb, thr_inner, thr_recs, progress);
         });
 
         Ok(Self {
@@ -76,13 +82,23 @@ impl LiveIndex {
     }
 }
 
-fn scan_dir(dir: &Path, embedder: &Embedder) -> Result<Vec<Record>> {
+fn scan_dir(
+    dir: &Path,
+    embedder: &Embedder,
+    progress: &Option<std::sync::mpsc::Sender<String>>,
+) -> Result<Vec<Record>> {
     let mut entries: Vec<PathBuf> = Vec::new();
     collect_files(dir, &mut entries)?;
+    let total = entries.len();
+    let done = AtomicUsize::new(0);
 
     let records: Vec<Result<Record>> = entries
         .par_iter()
         .map(|p| {
+            let count = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(ref tx) = progress {
+                let _ = tx.send(format!("Indexing {}/{}", count, total));
+            }
             let meta = std::fs::metadata(p)?;
             let _mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             let raw = std::fs::read(p)?;
@@ -152,6 +168,7 @@ fn poll_loop(
     embedder: Arc<Embedder>,
     inner: Arc<RwLock<Index>>,
     records: Arc<RwLock<Vec<Record>>>,
+    progress: Option<std::sync::mpsc::Sender<String>>,
 ) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -186,7 +203,7 @@ fn poll_loop(
         };
 
         if changed {
-            apply_changes(&disk, &embedder, &records, &index_path, &inner);
+            apply_changes(&disk, &embedder, &records, &index_path, &inner, &progress);
         }
     }
 }
@@ -197,46 +214,58 @@ fn apply_changes(
     records: &Arc<RwLock<Vec<Record>>>,
     index_path: &Path,
     inner: &Arc<RwLock<Index>>,
+    progress: &Option<std::sync::mpsc::Sender<String>>,
 ) {
     let mut recs = records.write().unwrap();
 
     recs.retain(|r| disk.contains_key(&r.path));
 
-    for (path, hash) in disk {
+    // Collect all (path, hash) pairs that need embedding (changed or new)
+    let to_process: Vec<(String, blake3::Hash)> = disk
+        .iter()
+        .filter(|(path, hash)| {
+            recs.iter()
+                .find(|r| r.path == **path)
+                .map(|existing| existing.hash != **hash)
+                .unwrap_or(true)
+        })
+        .map(|(p, h)| (p.clone(), *h))
+        .collect();
+    let total = to_process.len();
+
+    for (i, (path, hash)) in to_process.iter().enumerate() {
+        if let Some(ref tx) = progress {
+            let _ = tx.send(format!("Indexing {}/{}", i + 1, total));
+        }
+        let text = match extract_text(path.as_ref()) {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => continue,
+        };
         if let Some(existing) = recs.iter_mut().find(|r| r.path == *path) {
-            if existing.hash != *hash {
-                if let Ok(text) = extract_text(path.as_ref()) {
-                    let text = text.trim().to_string();
-                    if let Ok(embedding) = if text.is_empty() {
-                        Ok(vec![0.0f32; 384])
-                    } else if text.len() > 10000 {
-                        embedder.embed_chunked(&text)
-                    } else {
-                        embedder.embed(&text)
-                    } {
-                        existing.hash = *hash;
-                        existing.embedding = embedding;
-                    }
-                }
+            if let Ok(embedding) = if text.is_empty() {
+                Ok(vec![0.0f32; 384])
+            } else if text.len() > 10000 {
+                embedder.embed_chunked(&text)
+            } else {
+                embedder.embed(&text)
+            } {
+                existing.hash = *hash;
+                existing.embedding = embedding;
             }
         } else {
-            if let Ok(text) = extract_text(path.as_ref()) {
-                let text = text.trim().to_string();
-                let embedding = if text.is_empty() {
-                    vec![0.0f32; 384]
-                } else if text.len() > 10000 {
-                    embedder.embed_chunked(&text).unwrap_or(vec![0.0f32; 384])
-                } else {
-                    embedder.embed(&text).unwrap_or(vec![0.0f32; 384])
-                };
-                let _mtime = SystemTime::UNIX_EPOCH;
-                recs.push(Record {
-                    path: path.clone(),
-                    _mtime,
-                    hash: *hash,
-                    embedding,
-                });
-            }
+            let embedding = if text.is_empty() {
+                vec![0.0f32; 384]
+            } else if text.len() > 10000 {
+                embedder.embed_chunked(&text).unwrap_or(vec![0.0f32; 384])
+            } else {
+                embedder.embed(&text).unwrap_or(vec![0.0f32; 384])
+            };
+            recs.push(Record {
+                path: path.clone(),
+                _mtime: SystemTime::UNIX_EPOCH,
+                hash: *hash,
+                embedding,
+            });
         }
     }
     drop(recs);

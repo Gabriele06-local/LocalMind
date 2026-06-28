@@ -47,17 +47,14 @@ fn main() -> Result<()> {
         return demo(embedder);
     }
 
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
     let watch_dir = std::env::temp_dir().join("localmind_watch");
     let _ = std::fs::create_dir_all(&watch_dir);
     let index_path = watch_dir.join("index.bin");
-    let live = LiveIndex::new(watch_dir.clone(), index_path, embedder.clone())?;
+    let live = LiveIndex::new(watch_dir.clone(), index_path, embedder.clone(), Some(progress_tx))?;
     let index = live.get_index();
 
-    print!("Indexing existing files...");
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    println!(" {} files indexed.", index.read().unwrap().len());
-
-    tui::run(embedder, index)
+    tui::run(embedder, index, progress_rx)
 }
 
 fn demo(embedder: Arc<Embedder>) -> Result<()> {
@@ -168,7 +165,7 @@ fn demo(embedder: Arc<Embedder>) -> Result<()> {
     std::fs::create_dir_all(&watch_dir)?;
 
     let live_index_path = watch_dir.join("index.bin");
-    let live = LiveIndex::new(watch_dir.clone(), live_index_path, embedder.clone())?;
+    let live = LiveIndex::new(watch_dir.clone(), live_index_path, embedder.clone(), None)?;
 
     // 4a: Create and verify
     println!("\n-- 4a: Create file --");

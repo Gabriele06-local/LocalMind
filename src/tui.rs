@@ -25,7 +25,11 @@ struct SearchState {
     searched_query: String,
 }
 
-pub fn run(embedder: Arc<Embedder>, index: Arc<RwLock<Index>>) -> Result<()> {
+pub fn run(
+    embedder: Arc<Embedder>,
+    index: Arc<RwLock<Index>>,
+    progress_rx: std::sync::mpsc::Receiver<String>,
+) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         enable_raw_mode()?;
@@ -50,6 +54,14 @@ pub fn run(embedder: Arc<Embedder>, index: Arc<RwLock<Index>>) -> Result<()> {
 
         let res = loop {
             terminal.draw(|f| draw_ui(f, &query, cursor, &state, selected))?;
+
+            // Show indexing progress during initial scan and live re-indexing
+            while let Ok(msg) = progress_rx.try_recv() {
+                let mut s = state.lock().unwrap();
+                if !s.loading && s.searched_query.is_empty() {
+                    s.status = msg;
+                }
+            }
 
             if event::poll(std::time::Duration::from_millis(30))? {
                 match event::read()? {
