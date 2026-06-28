@@ -25,6 +25,7 @@ thiserror = "1"
 wide = "1.5"
 pdf-extract = "0.12"
 zip = "8"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [profile.release]
 lto = true
