@@ -39,9 +39,12 @@ Most "semantic search" tools require a vector database (Pinecone, Qdrant, Weavia
 - **Parallel + SIMD search**: cosine similarity computed with `rayon` across all cores, dot product accelerated with SIMD (`wide::f32x8` + FMA).
 - **Live monitoring**: a polling loop (1s interval) watches a directory, re-hashes files with `blake3`, and re-indexes only on actual changes. Searches are never blocked during reindexing (atomic `Arc<RwLock<Index>>` swap).
 - **Responsive TUI**: search bar with debounce, live results, keyboard navigation, file opening via `Enter`.
+- **Multi-format support**: indexes `.txt`, `.pdf`, and `.docx` files. PDF text extraction via [`pdf-extract`](https://crates.io/crates/pdf-extract), DOCX via inline ZIP/XML parsing.
 - **Small binary**: ~8 MB release build (LTO, strip, codegen-units=1), despite bundled BERT inference.
 
 ## How it works
+
+0. **`extract.rs`** — extracts text from `.txt`, `.pdf`, and `.docx` files. TXT uses plain `read_to_string`, PDF uses `pdf-extract` with `lopdf` backend, DOCX reads `word/document.xml` from the ZIP archive and strips XML tags.
 
 1. **`embed.rs`** — loads the model and tokenizer, runs the forward pass, applies mean pooling (masked by the attention mask) and L2 normalization to produce a 384-dimensional vector. Long texts are split into overlapping chunks (256-token windows, overlap 50), embedded separately, averaged, and re-normalized.
 
@@ -49,7 +52,7 @@ Most "semantic search" tools require a vector database (Pinecone, Qdrant, Weavia
 
 3. **`search.rs`** — computes cosine similarity between the query and every vector in the index, in parallel with `rayon`. The dot product and norm are computed in blocks of 8 floats using SIMD (FMA), with a scalar fallback for the remainder. Top-k results are extracted via `select_nth_unstable_by` to avoid a full sort.
 
-4. **`monitor.rs`** — a polling loop (every 1s) scans the watched directory, computes blake3 hashes for each `.txt` file, and compares against the previous state. Only changed files are re-embedded. The new index is written to a temp file, atomically renamed, then the `Arc` pointer is swapped under a brief write-lock — in-flight searches are never blocked for the duration of embedding.
+4. **`monitor.rs`** — a polling loop (every 1s) scans the watched directory for `.txt`, `.pdf`, and `.docx` files, computes blake3 hashes from raw bytes, and compares against the previous state. Text is extracted via `extract.rs` before embedding. Only changed files are re-embedded. The new index is written to a temp file, atomically renamed, then the `Arc` pointer is swapped under a brief write-lock — in-flight searches are never blocked for the duration of embedding.
 
 5. **`tui.rs`** — `ratatui`/`crossterm` interface: the query is sent with a 200ms debounce to a `tokio::spawn_blocking` task that performs embedding + search without blocking the UI render loop.
 
@@ -69,7 +72,6 @@ Embedding is accelerated by `candle`'s matrix multiplication backend ([`gemm` cr
 
 - **Brute-force search**: O(n) in the number of documents — parallelized but not approximated. Fine for tens of thousands of local files; for millions you'd want an approximate index (e.g., HNSW).
 - **English-centric tokenizer**: MiniLM handles Italian correctly via subword tokenization (e.g., "migliore" → `mig + ##lio + ##re`). Tests with mixed Italian/emoji/Japanese text produced valid embeddings (score 0.44 for "pizza"). The only `[UNK]` tokens were the emoji themselves. Semantic quality is still best for English.
-- **`.txt` files only**: no PDF, Word, source code parsing (yet).
 - **Polling monitor**: a pragmatic choice on Windows (`notify` produces unreliable `is_file` events). On Linux/macOS, `inotify`/`FSEvents` would be more responsive and consume zero CPU when nothing changes.
 
 ## Installation
@@ -112,6 +114,7 @@ Similarity scores are color-coded: green (>0.5), yellow (>0.3), gray (<0.3).
 ```
 src/
 ├── embed.rs    # model loading, tokenization, mean pooling, L2 norm
+├── extract.rs  # text extraction for .txt, .pdf, .docx
 ├── index.rs    # custom binary format, save/load via memmap2
 ├── search.rs   # parallel cosine similarity + SIMD, top-k
 ├── monitor.rs  # polling loop, blake3 hashing, thread-safe reindex
@@ -122,8 +125,8 @@ src/
 ## Roadmap
 
 - [ ] Approximate nearest neighbor index (HNSW) for large-scale datasets
-- [ ] Support for formats beyond `.txt` (Markdown, PDF, source code)
 - [ ] Native `inotify`/`FSEvents` monitoring on Linux/macOS (current polling is a pragmatic workaround for Windows)
+- [ ] Support for additional formats (Markdown, ODT, HTML)
 
 ## License
 

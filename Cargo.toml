@@ -23,6 +23,8 @@ crossterm = "0.29"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 thiserror = "1"
 wide = "1.5"
+pdf-extract = "0.12"
+zip = "8"
 
 [profile.release]
 lto = true

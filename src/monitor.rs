@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::embed::Embedder;
+use crate::extract::extract_text;
 use crate::index::Index;
 use crate::search::{top_k, Scored};
 
@@ -84,9 +85,10 @@ fn scan_dir(dir: &Path, embedder: &Embedder) -> Result<Vec<Record>> {
         .map(|p| {
             let meta = std::fs::metadata(p)?;
             let _mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let content = std::fs::read_to_string(p)?;
-            let hash = blake3::hash(content.as_bytes());
-            let text = content.trim().to_string();
+            let raw = std::fs::read(p)?;
+            let hash = blake3::hash(&raw);
+            let text = extract_text(p).unwrap_or_default();
+            let text = text.trim().to_string();
             let embedding = if text.is_empty() {
                 vec![0.0f32; 384]
             } else if text.len() > 10000 {
@@ -119,8 +121,11 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         }
         if path.is_dir() {
             collect_files(&path, out)?;
-        } else if path.is_file() && path.extension().map(|e| e == "txt").unwrap_or(false) {
-            out.push(path);
+        } else if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "txt" | "pdf" | "docx" | "doc") {
+                out.push(path);
+            }
         }
     }
     Ok(())
@@ -131,11 +136,11 @@ fn disk_snapshot(dir: &Path) -> Result<HashMap<String, blake3::Hash>> {
     collect_files(dir, &mut files)?;
     let mut map = HashMap::new();
     for p in &files {
-        let content = match std::fs::read_to_string(p) {
+        let raw = match std::fs::read(p) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let hash = blake3::hash(content.as_bytes());
+        let hash = blake3::hash(&raw);
         map.insert(p.to_string_lossy().to_string(), hash);
     }
     Ok(map)
@@ -200,8 +205,8 @@ fn apply_changes(
     for (path, hash) in disk {
         if let Some(existing) = recs.iter_mut().find(|r| r.path == *path) {
             if existing.hash != *hash {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    let text = content.trim().to_string();
+                if let Ok(text) = extract_text(path.as_ref()) {
+                    let text = text.trim().to_string();
                     if let Ok(embedding) = if text.is_empty() {
                         Ok(vec![0.0f32; 384])
                     } else if text.len() > 10000 {
@@ -215,8 +220,8 @@ fn apply_changes(
                 }
             }
         } else {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let text = content.trim().to_string();
+            if let Ok(text) = extract_text(path.as_ref()) {
+                let text = text.trim().to_string();
                 let embedding = if text.is_empty() {
                     vec![0.0f32; 384]
                 } else if text.len() > 10000 {
@@ -225,11 +230,10 @@ fn apply_changes(
                     embedder.embed(&text).unwrap_or(vec![0.0f32; 384])
                 };
                 let _mtime = SystemTime::UNIX_EPOCH;
-                let hash = blake3::hash(content.as_bytes());
                 recs.push(Record {
                     path: path.clone(),
                     _mtime,
-                    hash,
+                    hash: *hash,
                     embedding,
                 });
             }
