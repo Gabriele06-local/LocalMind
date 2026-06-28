@@ -104,6 +104,26 @@ strip = true
 
 `lto = true` enables cross-crate inlining — the SIMD hot path gets inlined and specialized. `codegen-units = 1` lets LLVM see the entire crate at once (better optimization at the cost of compile time). `strip = true` removes debug symbols. The result is a self-contained binary that includes the BERT model weights loader, the tokenizer, a TUI framework, and the entire search pipeline in ~8 MB.
 
+### Hybrid search (BM25 + vector) — the real value
+
+Pure semantic search has blind spots. Search for a tax code (`RSSMRA85M01H501U`), a serial number (`FW-2024-09-001`), or a rare surname (`Zaboglio`), and the vector embedding will scatter it across the semantic neighborhood — close to "tax", "serial", or "Zab" but never exact. BM25, the old Okapi ranking, finds exact term matches with subword precision.
+
+The idea is simple: run both searches, normalize the scores to [0, 1], and produce a combined score:
+
+```
+score = α · sim_vector + (1 - α) · sim_bm25
+```
+
+Where `α` is a blending parameter (0.7 is a good default). A file containing the exact query term *and* being semantically relevant beats everything else. A file with the exact term but irrelevant content stays near the bottom.
+
+The implementation challenge is building a BM25 index that lives alongside the vector index without doubling memory. A reasonable approach:
+
+1. **Inverted index**: `HashMap<String, Vec<(u32, u32)>>` mapping each token to `(doc_id, term_frequency)` pairs. The tokenizer is the same WordPiece used for embedding — no extra dependency.
+2. **Document metadata**: store each document's token count and unique term count for the length normalization factor.
+3. **Query-time**: tokenize the query, compute BM25 for each matching document, combine with the vector score via `α`, return top-k.
+
+This would give LocalMind a capability that most commercial vector search tools lack: **precision of exact match + recall of semantic search**, in a single local binary, no network calls.
+
 ### Why MiniLM-L6-v2
 
 The all-MiniLM-L6-v2 model produces 384-dimensional embeddings, compared to 768 for BERT-base or 1024 for BERT-large. This is a deliberate space/performance trade-off:
