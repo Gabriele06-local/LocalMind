@@ -106,23 +106,25 @@ strip = true
 
 ### Hybrid search (BM25 + vector) — the real value
 
-Pure semantic search has blind spots. Search for a tax code (`RSSMRA85M01H501U`), a serial number (`FW-2024-09-001`), or a rare surname (`Zaboglio`), and the vector embedding will scatter it across the semantic neighborhood — close to "tax", "serial", or "Zab" but never exact. BM25, the old Okapi ranking, finds exact term matches with subword precision.
+Pure semantic search has blind spots. Search for a tax code (`RSSMRA85M01H501U`), a serial number (`FW-2024-09-001`), or a rare surname (`Zaboglio`), and the vector embedding will scatter it across the semantic neighborhood — close to "tax", "serial", or "Zab" but never exact. BM25, the old Okapi ranking, finds exact term matches with character-level precision.
 
-The idea is simple: run both searches, normalize the scores to [0, 1], and produce a combined score:
+Combining two rankings is trickier than it sounds. A weighted sum (`score = α · sim_vec + (1 - α) · sim_bm25`) requires both scores to live in the same range — but BM25 is unbounded and corpus-dependent, while cosine similarity is always [0, 1]. Every time the document collection changes, the optimal α shifts. Instead, LocalMind uses **Reciprocal Rank Fusion (RRF)**:
 
 ```
-score = α · sim_vector + (1 - α) · sim_bm25
+RRF(doc) = 1 / (k + rank_vec(doc))  +  1 / (k + rank_bm25(doc))
 ```
 
-Where `α` is a blending parameter (0.7 is a good default). A file containing the exact query term *and* being semantically relevant beats everything else. A file with the exact term but irrelevant content stays near the bottom.
+Where `k = 60` (standard) and `rank` is the position (1-based) in each subsystem's result list. RRF works purely on **ordinal rank**, not raw scores:
+- **No normalization needed** — ranks are always integers from 1 to N.
+- **No parameter retuning** — k=60 works across collections of any size.
+- **Graceful degradation** — if BM25 finds no matches (rare terms that don't exist), its RRF contribution is zero; the vector score alone carries the result.
+- **No score coupling** — the vector and BM25 subsystems are completely independent; one can't drown the other.
 
-The implementation challenge is building a BM25 index that lives alongside the vector index without doubling memory. A reasonable approach:
+Two separate tokenizers live alongside each other:
+- **Vector search**: WordPiece (BERT's subword tokenizer). Captures morphological similarity — "running", "runs", "ran" all land near each other.
+- **BM25**: whitespace + punctuation split, lowercased, stop-word filtered. Catches exact literal matches — `RSSMRA85M01H501U` stays intact as a single token, no subword fragmentation.
 
-1. **Inverted index**: `HashMap<String, Vec<(u32, u32)>>` mapping each token to `(doc_id, term_frequency)` pairs. The tokenizer is the same WordPiece used for embedding — no extra dependency.
-2. **Document metadata**: store each document's token count and unique term count for the length normalization factor.
-3. **Query-time**: tokenize the query, compute BM25 for each matching document, combine with the vector score via `α`, return top-k.
-
-This would give LocalMind a capability that most commercial vector search tools lack: **precision of exact match + recall of semantic search**, in a single local binary, no network calls.
+The BM25 index is an inverted file: `HashMap<String, Vec<(u32, u32)>>` mapping each whitespace token to `(doc_id, term_frequency)` pairs, plus per-document total term counts for length normalization. When a document is added or modified, the inverted index is rebuilt from scratch — IDF changes globally, and incremental updates are notoriously bug-prone for BM25.
 
 ### Why MiniLM-L6-v2
 
@@ -235,7 +237,8 @@ src/
 ├── embed.rs    # model loading, tokenization, mean pooling, L2 norm
 ├── extract.rs  # text extraction for .txt, .pdf, .docx
 ├── index.rs    # custom binary format, save/load via memmap2
-├── search.rs   # parallel cosine similarity + SIMD, top-k
+├── bm25.rs     # inverted index, whitespace tokenizer, BM25 scorer
+├── search.rs   # hybrid top-k: vector SIMD + BM25 fused via RRF
 ├── monitor.rs  # polling loop, blake3 hashing, thread-safe reindex
 ├── tui.rs      # ratatui/crossterm terminal interface
 └── main.rs     # entry point, demo harness
@@ -243,6 +246,7 @@ src/
 
 ## Roadmap
 
+- [ ] Hybrid search (BM25 + vector via RRF) — inverted index, whitespace tokenizer, rank fusion
 - [ ] Approximate nearest neighbor index (HNSW) for large-scale datasets
 - [ ] Native `inotify`/`FSEvents` monitoring on Linux/macOS
 - [ ] Support for additional formats (Markdown, ODT, HTML)
