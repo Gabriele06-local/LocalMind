@@ -1,3 +1,4 @@
+mod bm25;
 mod embed;
 mod extract;
 mod index;
@@ -53,8 +54,9 @@ fn main() -> Result<()> {
     let index_path = watch_dir.join("index.bin");
     let live = LiveIndex::new(watch_dir.clone(), index_path, embedder.clone(), Some(progress_tx))?;
     let index = live.get_index();
+    let bm25 = live.get_bm25();
 
-    tui::run(embedder, index, progress_rx)
+    tui::run(embedder, index, bm25, progress_rx)
 }
 
 fn demo(embedder: Arc<Embedder>) -> Result<()> {

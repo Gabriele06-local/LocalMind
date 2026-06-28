@@ -19,9 +19,10 @@ use syntect::highlighting::{ThemeSet, Style as SynStyle};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use crate::bm25::Bm25Index;
 use crate::embed::Embedder;
 use crate::index::Index;
-use crate::search::top_k;
+use crate::search::top_k_hybrid;
 
 struct SearchState {
     results: Vec<crate::search::Scored>,
@@ -135,6 +136,7 @@ fn syn_style(s: &SynStyle) -> Style {
 pub fn run(
     embedder: Arc<Embedder>,
     index: Arc<RwLock<Index>>,
+    bm25: Arc<RwLock<Bm25Index>>,
     progress_rx: std::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -261,11 +263,13 @@ pub fn run(
                     let q = query.clone();
                     let emb = embedder.clone();
                     let idx = index.clone();
+                    let bm = bm25.clone();
                     tokio::task::spawn_blocking(move || {
                         let start = Instant::now();
                         if let Ok(embedding) = emb.embed(&q) {
                             let guard = idx.read().unwrap();
-                            let results = top_k(&guard, &embedding, 10);
+                            let bm25_guard = bm.read().unwrap();
+                            let results = top_k_hybrid(&guard, &bm25_guard, &embedding, &q, 10);
                             drop(guard);
                             let elapsed = start.elapsed();
                             let mut s = shared.lock().unwrap();

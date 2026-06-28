@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use wide::f32x8;
 
+use crate::bm25::Bm25Index;
 use crate::index::Index;
 
 pub struct Scored {
@@ -8,6 +9,9 @@ pub struct Scored {
     pub path: String,
 }
 
+const RRF_K: f32 = 60.0;
+
+/// Pure vector search (cosine similarity, SIMD-accelerated).
 pub fn top_k(index: &Index, query: &[f32], k: usize) -> Vec<Scored> {
     let dim = index.dim() as usize;
     let n = index.len() as usize;
@@ -37,6 +41,73 @@ pub fn top_k(index: &Index, query: &[f32], k: usize) -> Vec<Scored> {
         .map(|&(score, idx)| Scored {
             score,
             path: index.path(idx).to_string(),
+        })
+        .collect()
+}
+
+/// Hybrid search: vector cosine similarity fused with BM25 via RRF.
+pub fn top_k_hybrid(
+    index: &Index,
+    bm25: &Bm25Index,
+    query: &[f32],
+    query_text: &str,
+    k: usize,
+) -> Vec<Scored> {
+    let n = index.len() as usize;
+    if n == 0 || k == 0 || query_text.trim().is_empty() {
+        return top_k(index, query, k);
+    }
+    let k_vec = (k * 5).min(n);
+    let k_bm25 = (k * 5).min(bm25.len());
+
+    use std::collections::HashMap;
+
+    // 1. Vector search
+    let vec_results = top_k(index, query, k_vec);
+
+    // 2. BM25 search
+    let bm25_results = bm25.search(query_text, k_bm25);
+
+    // 3. RRF fusion — match by path
+
+    let mut vec_rank: HashMap<&str, usize> = HashMap::new();
+    for (i, r) in vec_results.iter().enumerate() {
+        vec_rank.insert(&r.path, i + 1);
+    }
+
+    let mut bm25_rank: HashMap<&str, usize> = HashMap::new();
+    for (i, (doc_id, _)) in bm25_results.iter().enumerate() {
+        bm25_rank.insert(index.path(*doc_id), i + 1);
+    }
+
+    let mut all_paths: Vec<&str> = Vec::new();
+    for p in vec_rank.keys() {
+        all_paths.push(p);
+    }
+    for p in bm25_rank.keys() {
+        if !vec_rank.contains_key(p) {
+            all_paths.push(p);
+        }
+    }
+
+    let mut rrf_scores: Vec<(f32, &str)> = all_paths
+        .into_iter()
+        .map(|path| {
+            let vr = vec_rank.get(path).copied().unwrap_or(usize::MAX) as f32;
+            let br = bm25_rank.get(path).copied().unwrap_or(usize::MAX) as f32;
+            let rrf = 1.0 / (RRF_K + vr) + 1.0 / (RRF_K + br);
+            (rrf, path)
+        })
+        .collect();
+
+    rrf_scores.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    rrf_scores.truncate(k);
+
+    rrf_scores
+        .into_iter()
+        .map(|(score, path)| Scored {
+            score,
+            path: path.to_string(),
         })
         .collect()
 }

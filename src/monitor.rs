@@ -8,6 +8,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use thiserror::Error;
 
+use crate::bm25::Bm25Index;
 use crate::embed::Embedder;
 use crate::extract::extract_text;
 use crate::index::Index;
@@ -25,12 +26,14 @@ struct Record {
     path: String,
     _mtime: SystemTime,
     hash: blake3::Hash,
+    text: String,
     embedding: Vec<f32>,
 }
 
 #[allow(dead_code)]
 pub struct LiveIndex {
     inner: Arc<RwLock<Index>>,
+    bm25: Arc<RwLock<Bm25Index>>,
     index_path: PathBuf,
     data_dir: PathBuf,
 }
@@ -55,18 +58,26 @@ impl LiveIndex {
         let index = Index::open(&index_path)?;
         let inner = Arc::new(RwLock::new(index));
 
+        let mut bm25 = Bm25Index::new();
+        for (id, rec) in records.iter().enumerate() {
+            bm25.add_document(id as u32, &rec.text);
+        }
+        let bm25 = Arc::new(RwLock::new(bm25));
+
         let records = Arc::new(RwLock::new(records));
         let thr_inner = inner.clone();
+        let thr_bm25 = bm25.clone();
         let thr_index = index_path.clone();
         let thr_dir = data_dir.clone();
         let thr_emb = embedder.clone();
         let thr_recs = records.clone();
         std::thread::spawn(move || {
-            poll_loop(thr_dir, thr_index, thr_emb, thr_inner, thr_recs, progress);
+            poll_loop(thr_dir, thr_index, thr_emb, thr_inner, thr_bm25, thr_recs, progress);
         });
 
         Ok(Self {
             inner,
+            bm25,
             index_path,
             data_dir,
         })
@@ -79,6 +90,10 @@ impl LiveIndex {
 
     pub fn get_index(&self) -> Arc<RwLock<Index>> {
         self.inner.clone()
+    }
+
+    pub fn get_bm25(&self) -> Arc<RwLock<Bm25Index>> {
+        self.bm25.clone()
     }
 }
 
@@ -118,6 +133,7 @@ fn scan_dir(
                 path: p.to_string_lossy().to_string(),
                 _mtime,
                 hash,
+                text,
                 embedding,
             })
         })
@@ -169,6 +185,7 @@ fn poll_loop(
     index_path: PathBuf,
     embedder: Arc<Embedder>,
     inner: Arc<RwLock<Index>>,
+    bm25: Arc<RwLock<Bm25Index>>,
     records: Arc<RwLock<Vec<Record>>>,
     progress: Option<std::sync::mpsc::Sender<String>>,
 ) {
@@ -205,7 +222,7 @@ fn poll_loop(
         };
 
         if changed {
-            apply_changes(&disk, &embedder, &records, &index_path, &inner, &progress);
+            apply_changes(&disk, &embedder, &records, &index_path, &inner, &bm25, &progress);
         }
     }
 }
@@ -216,13 +233,13 @@ fn apply_changes(
     records: &Arc<RwLock<Vec<Record>>>,
     index_path: &Path,
     inner: &Arc<RwLock<Index>>,
+    bm25: &Arc<RwLock<Bm25Index>>,
     progress: &Option<std::sync::mpsc::Sender<String>>,
 ) {
     let mut recs = records.write().unwrap();
 
     recs.retain(|r| disk.contains_key(&r.path));
 
-    // Collect all (path, hash) pairs that need embedding (changed or new)
     let to_process: Vec<(String, blake3::Hash)> = disk
         .iter()
         .filter(|(path, hash)| {
@@ -254,6 +271,7 @@ fn apply_changes(
                 embedder.embed(&text)
             } {
                 existing.hash = *hash;
+                existing.text = text;
                 existing.embedding = embedding;
             }
         } else {
@@ -268,11 +286,21 @@ fn apply_changes(
                 path: path.clone(),
                 _mtime: SystemTime::UNIX_EPOCH,
                 hash: *hash,
+                text,
                 embedding,
             });
         }
     }
     drop(recs);
+
+    // Rebuild BM25 index from records
+    let recs = records.read().unwrap();
+    let mut new_bm25 = Bm25Index::new();
+    for (id, rec) in recs.iter().enumerate() {
+        new_bm25.add_document(id as u32, &rec.text);
+    }
+    drop(recs);
+    *bm25.write().unwrap() = new_bm25;
 
     let (paths, vectors) = {
         let recs = records.read().unwrap();

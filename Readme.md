@@ -104,8 +104,6 @@ strip = true
 
 `lto = true` enables cross-crate inlining — the SIMD hot path gets inlined and specialized. `codegen-units = 1` lets LLVM see the entire crate at once (better optimization at the cost of compile time). `strip = true` removes debug symbols. The result is a self-contained binary that includes the BERT model weights loader, the tokenizer, a TUI framework, and the entire search pipeline in ~8 MB.
 
-
-
 ### Why MiniLM-L6-v2
 
 The all-MiniLM-L6-v2 model produces 384-dimensional embeddings, compared to 768 for BERT-base or 1024 for BERT-large. This is a deliberate space/performance trade-off:
@@ -115,9 +113,21 @@ The all-MiniLM-L6-v2 model produces 384-dimensional embeddings, compared to 768 
 
 ## Technical Deep-Dive
 
-### Planned: Hybrid search (BM25 + RRF)
+### Hybrid search (BM25 + RRF)
 
-Hybrid search combining BM25's exact-term precision with vector semantic similarity is the next major feature. The design is settled — **Reciprocal Rank Fusion** (`RRF = 1/(60+rank_vec) + 1/(60+rank_bm25)`) with a whitespace-based tokenizer for BM25 and WordPiece for vectors — but the implementation is not yet in the codebase. See the roadmap below.
+Hybrid search combines the exact-term precision of BM25 with the semantic power of vector embeddings. The two subsystems are independent and are fused at query time using **Reciprocal Rank Fusion (RRF)**:
+
+```
+RRF(doc) = 1 / (60 + rank_vec(doc))  +  1 / (60 + rank_bm25(doc))
+```
+
+RRF works purely on ordinal rank, not raw scores — so there is no normalization problem, no parameter to retune when the collection changes, and either subsystem can be absent (if BM25 finds no matches, its contribution is zero). A document that ranks #1 in both systems scores highest; a document that BM25 doesn't match at all still appears if its vector score is strong enough.
+
+Two separate tokenizers live alongside each other:
+- **Vector search**: WordPiece (BERT's subword tokenizer). "Running", "runs", and "ran" all map to nearby embeddings.
+- **BM25**: whitespace + punctuation split, lowercased. `RSSMRA85M01H501U` stays intact as a single token — no subword fragmentation.
+
+The BM25 index is an inverted file: `HashMap<String, Vec<(u32, u32)>>` mapping each whitespace token to `(doc_id, term_frequency)` pairs, with per-document total term counts for BM25 length normalization (k1=1.2, b=0.75). The index is rebuilt from scratch whenever a file changes — IDF shifts globally, and incremental updates are too error-prone to justify the complexity.
 
 ### The binary index format — O(1) access without deserialization
 
@@ -229,10 +239,11 @@ Similarity scores are color-coded: green (>0.5), yellow (>0.3), gray (<0.3).
 
 ```
 src/
+├── bm25.rs     # BM25 inverted index, whitespace tokenizer, scoring
 ├── embed.rs    # model loading, tokenization, mean pooling, L2 norm
 ├── extract.rs  # text extraction for .txt, .pdf, .docx
 ├── index.rs    # custom binary format, save/load via memmap2
-├── search.rs   # top-k vector search with parallel SIMD, RRF planned
+├── search.rs   # top-k vector SIMD + BM25 hybrid fused via RRF
 ├── monitor.rs  # polling loop, blake3 hashing, thread-safe reindex
 ├── tui.rs      # ratatui/crossterm terminal interface
 └── main.rs     # entry point, demo harness
@@ -240,7 +251,7 @@ src/
 
 ## Roadmap
 
-- [ ] **Hybrid search (BM25 + RRF)** — inverted index with whitespace tokenizer, reciprocal rank fusion. Design complete (see Technical Deep-Dive), code not yet implemented.
+- [x] **Hybrid search (BM25 + RRF)** — inverted index, whitespace tokenizer, reciprocal rank fusion with k=60
 - [ ] Approximate nearest neighbor index (HNSW) for large-scale datasets
 - [ ] Native `inotify`/`FSEvents` monitoring on Linux/macOS
 - [ ] Support for additional formats (Markdown, ODT, HTML)
