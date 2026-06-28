@@ -97,7 +97,9 @@ fn scan_dir(
         .map(|p| {
             let count = done.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(ref tx) = progress {
-                let _ = tx.send(format!("Indexing {}/{}", count, total));
+                if count % 10 == 0 || count == total {
+                    let _ = tx.send(format!("Indexing {}/{}", count, total));
+                }
             }
             let meta = std::fs::metadata(p)?;
             let _mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -235,7 +237,9 @@ fn apply_changes(
 
     for (i, (path, hash)) in to_process.iter().enumerate() {
         if let Some(ref tx) = progress {
-            let _ = tx.send(format!("Indexing {}/{}", i + 1, total));
+            if i % 10 == 0 || i + 1 == total {
+                let _ = tx.send(format!("Indexing {}/{}", i + 1, total));
+            }
         }
         let text = match extract_text(path.as_ref()) {
             Ok(t) => t.trim().to_string(),

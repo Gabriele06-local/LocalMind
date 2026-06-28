@@ -55,10 +55,10 @@ pub fn run(
         let res = loop {
             terminal.draw(|f| draw_ui(f, &query, cursor, &state, selected))?;
 
-            // Show indexing progress during initial scan and live re-indexing
+            // Show indexing progress only when user is not typing or searching
             while let Ok(msg) = progress_rx.try_recv() {
                 let mut s = state.lock().unwrap();
-                if !s.loading && s.searched_query.is_empty() {
+                if !s.loading && s.searched_query.is_empty() && query.is_empty() {
                     s.status = msg;
                 }
             }
