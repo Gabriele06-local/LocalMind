@@ -104,27 +104,7 @@ strip = true
 
 `lto = true` enables cross-crate inlining — the SIMD hot path gets inlined and specialized. `codegen-units = 1` lets LLVM see the entire crate at once (better optimization at the cost of compile time). `strip = true` removes debug symbols. The result is a self-contained binary that includes the BERT model weights loader, the tokenizer, a TUI framework, and the entire search pipeline in ~8 MB.
 
-### Hybrid search (BM25 + vector) — the real value
 
-Pure semantic search has blind spots. Search for a tax code (`RSSMRA85M01H501U`), a serial number (`FW-2024-09-001`), or a rare surname (`Zaboglio`), and the vector embedding will scatter it across the semantic neighborhood — close to "tax", "serial", or "Zab" but never exact. BM25, the old Okapi ranking, finds exact term matches with character-level precision.
-
-Combining two rankings is trickier than it sounds. A weighted sum (`score = α · sim_vec + (1 - α) · sim_bm25`) requires both scores to live in the same range — but BM25 is unbounded and corpus-dependent, while cosine similarity is always [0, 1]. Every time the document collection changes, the optimal α shifts. Instead, LocalMind uses **Reciprocal Rank Fusion (RRF)**:
-
-```
-RRF(doc) = 1 / (k + rank_vec(doc))  +  1 / (k + rank_bm25(doc))
-```
-
-Where `k = 60` (standard) and `rank` is the position (1-based) in each subsystem's result list. RRF works purely on **ordinal rank**, not raw scores:
-- **No normalization needed** — ranks are always integers from 1 to N.
-- **No parameter retuning** — k=60 works across collections of any size.
-- **Graceful degradation** — if BM25 finds no matches (rare terms that don't exist), its RRF contribution is zero; the vector score alone carries the result.
-- **No score coupling** — the vector and BM25 subsystems are completely independent; one can't drown the other.
-
-Two separate tokenizers live alongside each other:
-- **Vector search**: WordPiece (BERT's subword tokenizer). Captures morphological similarity — "running", "runs", "ran" all land near each other.
-- **BM25**: whitespace + punctuation split, lowercased, stop-word filtered. Catches exact literal matches — `RSSMRA85M01H501U` stays intact as a single token, no subword fragmentation.
-
-The BM25 index is an inverted file: `HashMap<String, Vec<(u32, u32)>>` mapping each whitespace token to `(doc_id, term_frequency)` pairs, plus per-document total term counts for length normalization. When a document is added or modified, the inverted index is rebuilt from scratch — IDF changes globally, and incremental updates are notoriously bug-prone for BM25.
 
 ### Why MiniLM-L6-v2
 
@@ -135,23 +115,9 @@ The all-MiniLM-L6-v2 model produces 384-dimensional embeddings, compared to 768 
 
 ## Technical Deep-Dive
 
-### Reciprocal Rank Fusion — why ranks, not scores
+### Planned: Hybrid search (BM25 + RRF)
 
-Fusing a vector similarity score (bounded [0, 1]) with a BM25 score (unbounded, corpus-dependent) using a weighted sum would require normalizing both to the same range — and re-normalizing every time the document collection changes. LocalMind avoids this entirely by using **Reciprocal Rank Fusion (RRF)**:
-
-```
-RRF(doc) = 1 / (60 + rank_vec(doc))  +  1 / (60 + rank_bm25(doc))
-```
-
-The insight is simple: both subsystems, no matter how different their scoring functions, produce a **ranked list** of documents. A rank is always an integer from 1 to N — it doesn't drift when you add files. The RRF formula transforms these ordinal positions into a fused score where:
-
-- A document ranked #1 by both systems gets `1/(60+1) + 1/(60+1) ≈ 0.033` — the highest possible.
-- A document ranked #1 by one system and #100 by the other gets `1/61 + 1/160 ≈ 0.023` — still competitive.
-- A document that BM25 doesn't match at all gets `0 + 1/(60+rank_vec)` — BM25 simply contributes nothing.
-
-The constant `k = 60` controls how much weight a high rank has. With k=60, the difference between rank 1 and rank 10 is `(1/61 - 1/70) ≈ 0.002` — small enough that a document ranked #10 by both systems still beats one ranked #1 by one system and missing entirely from the other.
-
-This stability is RRF's killer feature. You never touch k. You never re-normalize. You just run two independent searches and fuse the ranks.
+Hybrid search combining BM25's exact-term precision with vector semantic similarity is the next major feature. The design is settled — **Reciprocal Rank Fusion** (`RRF = 1/(60+rank_vec) + 1/(60+rank_bm25)`) with a whitespace-based tokenizer for BM25 and WordPiece for vectors — but the implementation is not yet in the codebase. See the roadmap below.
 
 ### The binary index format — O(1) access without deserialization
 
@@ -266,8 +232,7 @@ src/
 ├── embed.rs    # model loading, tokenization, mean pooling, L2 norm
 ├── extract.rs  # text extraction for .txt, .pdf, .docx
 ├── index.rs    # custom binary format, save/load via memmap2
-├── bm25.rs     # inverted index, whitespace tokenizer, BM25 scorer
-├── search.rs   # hybrid top-k: vector SIMD + BM25 fused via RRF
+├── search.rs   # top-k vector search with parallel SIMD, RRF planned
 ├── monitor.rs  # polling loop, blake3 hashing, thread-safe reindex
 ├── tui.rs      # ratatui/crossterm terminal interface
 └── main.rs     # entry point, demo harness
@@ -275,7 +240,7 @@ src/
 
 ## Roadmap
 
-- [ ] Hybrid search (BM25 + vector via RRF) — inverted index, whitespace tokenizer, rank fusion
+- [ ] **Hybrid search (BM25 + RRF)** — inverted index with whitespace tokenizer, reciprocal rank fusion. Design complete (see Technical Deep-Dive), code not yet implemented.
 - [ ] Approximate nearest neighbor index (HNSW) for large-scale datasets
 - [ ] Native `inotify`/`FSEvents` monitoring on Linux/macOS
 - [ ] Support for additional formats (Markdown, ODT, HTML)
