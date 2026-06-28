@@ -57,18 +57,16 @@ Most "semantic search" tools require a vector database (Pinecone, Qdrant, Weavia
 
 | Operation | Latency |
 |---|---|
-| Query embedding (1st, cold start) | ~1.5s |
-| Query embedding (subsequent) | ~1.2-1.5s |
-| Search (3-10 documents) | ~0.3-0.5ms |
+| Query embedding (BERT forward pass) | ~55–65ms |
+| Index search (8 documents) | ~0.05–0.13ms |
 | Initial model download | ~90MB (one-time) |
 | Release binary | ~8 MB |
 | Monitor polling interval | 1 scan/s |
 
-Search is sub-millisecond even on thousands of documents. The bottleneck is entirely BERT inference on CPU — achieving significant speedups requires INT8 quantization (estimated 2-4x) or GPU acceleration.
+Embedding is accelerated by `candle`'s matrix multiplication backend ([`gemm` crate](https://crates.io/crates/gemm)), which detects AVX-512/AVX2/SSE at runtime. Search is sub-millisecond even on thousands of documents.
 
 ## Known limitations
 
-- **Embedding latency**: ~1.2-1.5s per query on CPU (no hardware acceleration). The UI shows `Searching...` and dims the search bar during inference.
 - **Brute-force search**: O(n) in the number of documents — parallelized but not approximated. Fine for tens of thousands of local files; for millions you'd want an approximate index (e.g., HNSW).
 - **English-centric tokenizer**: MiniLM handles Italian correctly via subword tokenization (e.g., "migliore" → `mig + ##lio + ##re`). Tests with mixed Italian/emoji/Japanese text produced valid embeddings (score 0.44 for "pizza"). The only `[UNK]` tokens were the emoji themselves. Semantic quality is still best for English.
 - **`.txt` files only**: no PDF, Word, source code parsing (yet).
@@ -123,7 +121,6 @@ src/
 
 ## Roadmap
 
-- [ ] INT8 model quantization for 2-4x embedding speedup
 - [ ] Approximate nearest neighbor index (HNSW) for large-scale datasets
 - [ ] Support for formats beyond `.txt` (Markdown, PDF, source code)
 - [ ] Native `inotify`/`FSEvents` monitoring on Linux/macOS (current polling is a pragmatic workaround for Windows)
