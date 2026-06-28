@@ -17,6 +17,17 @@ No external database, no cloud service, no API key. Everything runs locally on C
                                               └──────────┘
 ```
 
+## Screenshots
+
+![Empty TUI with search bar](img/tui_empty.png)
+*Empty TUI — write a query and press Enter (or wait for automatic search)*
+
+![Searching in progress](img/tui_searching.png)
+*Query submitted, embedding in progress (~1.5s on CPU)*
+
+![Results](img/tui_results.png)
+*Results with similarity score, keyboard navigation via arrows*
+
 ## Why
 
 Most "semantic search" tools require a vector database (Pinecone, Qdrant, Weaviate...) or run via Python with heavy dependencies. LocalMind does the same with a single self-contained Rust binary: a custom binary index format, memory-mapped access, hand-written SIMD vector math, and a responsive terminal UI.
